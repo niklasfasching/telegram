@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
+	"mime/multipart"
 	"net/http"
 	"reflect"
 	"strconv"
@@ -53,7 +55,9 @@ func (c *Connection) Start() error {
 		log.Println("Started:", prettyPrintJSON(c.user))
 	}
 	for !c.stopped {
-		c.handleUpdates()
+		if err := c.handleUpdates(); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -61,15 +65,21 @@ func (c *Connection) Start() error {
 func (c *Connection) Stop() { c.stopped = true }
 
 func (c *Connection) Call(method string, data, result interface{}) error {
-	if data == nil {
-		data = map[string]interface{}{}
-	}
-	body, err := json.Marshal(data)
+	url := fmt.Sprintf("https://api.telegram.org/bot%s/%s", c.Token, method)
+	m, err := toMap(data)
 	if err != nil {
 		return err
 	}
-	url := fmt.Sprintf("https://api.telegram.org/bot%s/%s", c.Token, method)
-	res, err := http.Post(url, "application/json", bytes.NewBuffer(body))
+	body, contentType, err := encodeMultipartBody(m)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest("POST", url, body)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", contentType)
+	res, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -86,7 +96,10 @@ func (c *Connection) Call(method string, data, result interface{}) error {
 	if !r.OK {
 		return fmt.Errorf("%s (%d) (%s: %s)", r.Description, r.ErrorCode, method, prettyPrintJSON(data))
 	}
-	return json.Unmarshal(r.Result, result)
+	if result != nil {
+		return json.Unmarshal(r.Result, result)
+	}
+	return nil
 }
 
 func (c *Connection) handleUpdates() error {
@@ -162,4 +175,67 @@ func prettyPrintJSON(v interface{}) string {
 	json.SetIndent("", "  ")
 	json.Encode(v)
 	return out.String()
+}
+
+func encodeMultipartBody(data map[string]interface{}) (io.Reader, string, error) {
+	if len(data) == 0 {
+		return &bytes.Buffer{}, "application/json", nil
+	}
+	body := &bytes.Buffer{}
+	form := multipart.NewWriter(body)
+	for k, v := range data {
+		switch v := v.(type) {
+		case io.Reader:
+			w, err := form.CreateFormFile(k, k)
+			if err != nil {
+				return nil, "", err
+			}
+			if _, err = io.Copy(w, v); err != nil {
+				return nil, "", err
+			}
+		case string:
+			if err := form.WriteField(k, v); err != nil {
+				return nil, "", err
+			}
+		default:
+			bs, err := json.Marshal(v)
+			if err != nil {
+				return nil, "", err
+			}
+			if err := form.WriteField(k, string(bs)); err != nil {
+				return nil, "", err
+			}
+		}
+	}
+	return body, form.FormDataContentType(), form.Close()
+}
+
+func toMap(data interface{}) (map[string]interface{}, error) {
+	m, v := map[string]interface{}{}, reflect.ValueOf(data)
+	if data == nil {
+		return m, nil
+	}
+	if v.Kind() == reflect.Ptr {
+		v = v.Elem()
+	}
+	switch v.Kind() {
+	case reflect.Struct:
+		t := v.Type()
+		for i := 0; i < v.NumField(); i++ {
+			k := t.Field(i).Name
+			if tag := t.Field(i).Tag.Get("json"); tag != "" {
+				if jsonKey := strings.Split(tag, ",")[0]; jsonKey != "" {
+					k = jsonKey
+				}
+			}
+			m[k] = v.Field(i).Interface()
+		}
+	case reflect.Map:
+		for _, k := range v.MapKeys() {
+			m[k.String()] = v.MapIndex(k).Interface()
+		}
+	default:
+		return nil, fmt.Errorf("cannot toMap %s", v.Kind())
+	}
+	return m, nil
 }
