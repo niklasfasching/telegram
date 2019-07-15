@@ -1,0 +1,5 @@
+* yet another telegram bot
+i want to write a shitty telegram bot but don't want to pull in a huge dependency. Telegram bots can't be that hard, right?
+** considerations
+- writing out all the models is a chore. We could try autogenerating them from the api docs.
+  For now we allow the user to provide whatever they want via Handle(kind, func(T) error)
